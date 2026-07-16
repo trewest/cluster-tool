@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import ipaddress
+import re
 import socket
 import xml.etree.ElementTree as ET
 
@@ -537,6 +538,205 @@ def gen_haproxy_additions(clone_id, subnet):
         f"    server ingress {ip}:80 check\n"
     )
     return use_backends, backends
+
+
+def _parse_network_info(network_name):
+    r = env.run(f"virsh net-dumpxml {shlex.quote(network_name)}", check=False)
+    if r.returncode != 0:
+        sys.exit(f"Cannot read libvirt network '{network_name}': {r.stderr.strip()}")
+    root = ET.fromstring(r.stdout)
+
+    domain_elem = root.find(".//domain")
+    if domain_elem is None or not domain_elem.get("name"):
+        sys.exit(f"Network '{network_name}' has no <domain> element.")
+    cluster_domain = f"apps.{domain_elem.get('name')}"
+
+    host_elem = root.find(".//dhcp/host[@ip]")
+    if host_elem is None:
+        sys.exit(f"Network '{network_name}' has no DHCP host entry with an IP.")
+    node_ip = host_elem.get("ip")
+
+    return node_ip, cluster_domain
+
+
+def _detect_dnsmasq():
+    # Separate from _dnsmasq_dir(): clone DNS always uses NM, but agent-VM
+    # hosts (CI runners) may run standalone dnsmasq instead.
+    r = env.run("systemctl is-active dnsmasq", check=False)
+    if r.returncode == 0:
+        return "standalone", "/etc/dnsmasq.d"
+    return "nm", "/etc/NetworkManager/dnsmasq.d"
+
+
+def _agent_vm_reload_dns(kind):
+    if kind == "standalone":
+        env.run("systemctl restart dnsmasq")
+    else:
+        env.run("nmcli general reload")
+
+
+def _agent_vm_dns_slug(cluster_domain):
+    return re.sub(r'[^a-zA-Z0-9]', '-', cluster_domain)
+
+
+def _agent_vm_add_dns(cluster_domain, node_ip):
+    kind, dnsmasq_dir = _detect_dnsmasq()
+    slug = _agent_vm_dns_slug(cluster_domain)
+    conf_path = f"{dnsmasq_dir}/{slug}.conf"
+    content = f"address=/.{cluster_domain}/{node_ip}"
+
+    r = env.run(f"cat {conf_path}", check=False)
+    if r.returncode == 0 and r.stdout.strip() == content:
+        print(f"  DNS already configured: *.{cluster_domain} -> {node_ip}")
+        return
+
+    env.run(f"mkdir -p {dnsmasq_dir}")
+    env.write_file(conf_path, content + "\n")
+    _agent_vm_reload_dns(kind)
+    print(f"  DNS configured: *.{cluster_domain} -> {node_ip}")
+
+
+def _agent_vm_remove_dns(cluster_domain):
+    kind, dnsmasq_dir = _detect_dnsmasq()
+    slug = _agent_vm_dns_slug(cluster_domain)
+    conf_path = f"{dnsmasq_dir}/{slug}.conf"
+
+    r = env.run(f"test -f {conf_path}", check=False)
+    if r.returncode != 0:
+        return
+    env.run(f"rm -f {conf_path}")
+    _agent_vm_reload_dns(kind)
+    print(f"  DNS entry removed: *.{cluster_domain}")
+
+
+def _agent_vm_download_iso(iso_url, storage_dir):
+    iso_path = f"{storage_dir}/discovery.iso"
+    quoted_url = shlex.quote(iso_url)
+
+    print("  Waiting for assisted-image-service...")
+    for attempt in range(1, 31):
+        r = env.run(f"curl -k -s -o /dev/null -w '%{{http_code}}' -L --connect-timeout 30 --max-time 300 {quoted_url}", check=False)
+        code = r.stdout.strip().strip("'")
+        if code == "200":
+            break
+        print(f"    attempt {attempt}/30 - HTTP {code}, retrying in 10s...")
+        time.sleep(10)
+    else:
+        sys.exit(f"assisted-image-service not ready after 30 attempts (last HTTP {code})")
+
+    print("  Downloading discovery ISO...")
+    env.run(f"curl -k -L --fail-with-body --connect-timeout 30 --max-time 300 -o {iso_path} {quoted_url}")
+
+
+def _agent_vm_create_vm(name, network, storage_dir, memory, vcpus, disk_size):
+    disk_path = f"{storage_dir}/{name}.qcow2"
+    iso_path = f"{storage_dir}/discovery.iso"
+
+    r = env.run(f"virsh domstate {shlex.quote(name)}", check=False)
+    if r.returncode == 0:
+        print(f"  Removing existing VM '{name}'...")
+        if "shut off" not in r.stdout:
+            env.run(f"virsh destroy {shlex.quote(name)}")
+        env.run(f"virsh undefine {shlex.quote(name)}")
+
+    env.run(f"rm -f {disk_path}")
+
+    print(f"  Creating disk {disk_path} ({disk_size})...")
+    env.run(f"qemu-img create -f qcow2 {disk_path} {shlex.quote(disk_size)}")
+
+    print(f"  Creating VM '{name}'...")
+    cmd = (
+        f"virt-install"
+        f" --name {shlex.quote(name)}"
+        f" --memory {memory}"
+        f" --vcpus {vcpus}"
+        f" --disk {disk_path},device=disk"
+        f" --disk {iso_path},device=cdrom,readonly=on"
+        f" --network network={shlex.quote(network)}"
+        f" --os-variant rhel9.0"
+        f" --boot hd,cdrom"
+        # The VM powers off after the OS is written to disk; restart so it boots the installed OS
+        f" --events on_poweroff=restart"
+        f" --noautoconsole"
+    )
+    env.run(cmd)
+    print(f"  VM '{name}' created and booting")
+
+
+def _agent_vm_destroy_vm(name, storage_dir):
+    disk_path = f"{storage_dir}/{name}.qcow2"
+
+    r = env.run(f"virsh domstate {shlex.quote(name)}", check=False)
+    if r.returncode == 0:
+        if "shut off" not in r.stdout:
+            env.run(f"virsh destroy {shlex.quote(name)}")
+        env.run(f"virsh undefine {shlex.quote(name)}")
+        print(f"  VM '{name}' destroyed")
+    else:
+        print(f"  VM '{name}' not found, skipping")
+
+    env.run(f"rm -f {disk_path}", check=False)
+    print(f"  Disk {disk_path} removed")
+
+
+def _agent_vm_remaining(storage_dir, exclude_name):
+    r = env.run(f"ls {storage_dir}/*.qcow2 2>/dev/null", check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return []
+    return [f for f in r.stdout.strip().split("\n")
+            if not f.endswith(f"/{exclude_name}.qcow2")]
+
+
+def cmd_agent_vm(args):
+    if args.destroy:
+        name = args.name
+        storage_dir = args.storage_dir
+        print(f"Destroying agent VM '{name}'...")
+        _agent_vm_destroy_vm(name, storage_dir)
+
+        remaining = _agent_vm_remaining(storage_dir, name)
+        if not remaining:
+            print("  No other agent VMs remain, cleaning up shared resources...")
+            env.run(f"rm -f {storage_dir}/discovery.iso", check=False)
+            print("  Discovery ISO removed")
+
+            cluster_domain = args.cluster_domain
+            if not cluster_domain and args.network:
+                _, cluster_domain = _parse_network_info(args.network)
+            if cluster_domain:
+                _agent_vm_remove_dns(cluster_domain)
+            else:
+                print("  WARNING: --network or --cluster-domain not provided, skipping DNS cleanup")
+        else:
+            print(f"  {len(remaining)} other agent VM(s) remain, keeping shared resources")
+
+        print(f"Agent VM '{name}' cleanup complete.")
+        return
+
+    if not args.network:
+        sys.exit("--network is required for agent-vm creation")
+    if not args.iso_url:
+        sys.exit("--iso-url is required for agent-vm creation")
+
+    node_ip, cluster_domain = _parse_network_info(args.network)
+    if args.node_ip:
+        node_ip = args.node_ip
+    if args.cluster_domain:
+        cluster_domain = args.cluster_domain
+
+    name = args.name
+    storage_dir = args.storage_dir
+    print(f"Creating agent VM '{name}'...")
+    print(f"  Network: {args.network}")
+    print(f"  Node IP: {node_ip}")
+    print(f"  Cluster domain: {cluster_domain}")
+
+    env.run(f"mkdir -p {storage_dir}")
+    _agent_vm_add_dns(cluster_domain, node_ip)
+    _agent_vm_download_iso(args.iso_url, storage_dir)
+    _agent_vm_create_vm(name, args.network, storage_dir, args.memory, args.vcpus, args.disk_size)
+
+    print(f"Agent VM '{name}' is ready.")
 
 
 def gen_dnsmasq_conf(clone_id):
@@ -1734,11 +1934,23 @@ def main():
     use_p = sub.add_parser("use", help="Set default server")
     use_p.add_argument("name", help="Server alias to set as default")
 
-    for p in [snap_p, boot_p, list_p, flavors_p, verify_p, destroy_p, push_p, pull_p]:
+    agent_vm_p = sub.add_parser("agent-vm", help="Create or destroy an agent VM for CaaS")
+    agent_vm_p.add_argument("--network", help="Libvirt network name (e.g. test-infra-net-caas)")
+    agent_vm_p.add_argument("--iso-url", help="Discovery ISO download URL")
+    agent_vm_p.add_argument("--name", default="agent-worker-01", help="VM name (default: agent-worker-01)")
+    agent_vm_p.add_argument("--memory", type=int, default=16384, help="Memory in MiB (default: 16384)")
+    agent_vm_p.add_argument("--vcpus", type=int, default=4, help="Number of vCPUs (default: 4)")
+    agent_vm_p.add_argument("--disk-size", default="120G", help="Disk size (default: 120G)")
+    agent_vm_p.add_argument("--storage-dir", default="/data/osac-storage", help="Storage directory (default: /data/osac-storage)")
+    agent_vm_p.add_argument("--cluster-domain", help="Apps domain for DNS (default: derived from network)")
+    agent_vm_p.add_argument("--node-ip", help="Node IP for DNS (default: derived from network)")
+    agent_vm_p.add_argument("--destroy", action="store_true", help="Destroy the agent VM instead of creating it")
+
+    for p in [snap_p, boot_p, list_p, flavors_p, verify_p, destroy_p, push_p, pull_p, agent_vm_p]:
         p.add_argument("--server", help="Server alias (default: from config)")
 
     args = parser.parse_args()
-    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy, "push": cmd_push, "pull": cmd_pull}
+    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy, "push": cmd_push, "pull": cmd_pull, "agent-vm": cmd_agent_vm}
 
     if args.command == "setup":
         cmd_setup(args)

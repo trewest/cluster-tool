@@ -410,12 +410,14 @@ class TestTemplates(unittest.TestCase):
 class TestDnsEntry(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig_dnsmasq_dir = ct.DNSMASQ_DIR
-        ct.DNSMASQ_DIR = Path(self.tmpdir)
         ct.env = ct.ExecutionEnv(host="test@host", host_ip="10.0.0.1")
+        ct._dnsmasq_dir.cache_clear()
+        self._patcher = patch.object(ct, "_dnsmasq_dir", return_value=Path(self.tmpdir))
+        self._patcher.start()
 
     def tearDown(self):
-        ct.DNSMASQ_DIR = self._orig_dnsmasq_dir
+        self._patcher.stop()
+        ct._dnsmasq_dir.cache_clear()
 
     @patch("subprocess.run")
     def test_add_dns_entry_creates_file(self, mock_run):
@@ -1912,7 +1914,7 @@ class TestSetupClient(unittest.TestCase):
         resolv.write_text("nameserver 127.0.0.1\n")
 
         with patch.dict(os.environ, {"SUDO_USER": "testuser"}), \
-             patch.object(ct, "DNSMASQ_DIR", dnsmasq_dir), \
+             patch.object(ct, "_dnsmasq_dir", return_value=dnsmasq_dir), \
              patch("pathlib.Path", wraps=Path) as mock_path:
             orig_path = Path
             class PatchedPath(type(Path())):
@@ -2584,6 +2586,325 @@ class TestPullSecretInjection(unittest.TestCase):
         self.assertIn("--pull=missing", recert_cmd)
         self.assertNotIn("--pull=newer", recert_cmd)
         ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
+
+
+SAMPLE_NETWORK_XML = """\
+<network xmlns:dnsmasq="http://libvirt.org/schemas/network/dnsmasq/1.0">
+  <name>test-infra-net-caas</name>
+  <forward mode='nat'><nat><port start='1024' end='65535'/></nat></forward>
+  <bridge name='br-caas1234' stp='on' delay='0'/>
+  <mtu size='1500'/>
+  <domain name='test-infra-cluster-caas.redhat.com' localOnly='yes'/>
+  <dns enable='yes'>
+    <host ip='192.168.160.10'>
+      <hostname>api-int.test-infra-cluster-caas.redhat.com</hostname>
+      <hostname>api.test-infra-cluster-caas.redhat.com</hostname>
+    </host>
+  </dns>
+  <ip family='ipv4' address='192.168.160.1' prefix='24'>
+    <dhcp>
+      <range start='192.168.160.128' end='192.168.160.254'/>
+      <host mac='02:00:00:aa:bb:cc' name='test-infra-cluster-caas-master-0' ip='192.168.160.10'/>
+    </dhcp>
+  </ip>
+  <dnsmasq:options>
+    <dnsmasq:option value="address=/.apps.test-infra-cluster-caas.redhat.com/192.168.160.10"/>
+  </dnsmasq:options>
+</network>"""
+
+
+class TestParseNetworkInfo(unittest.TestCase):
+    def setUp(self):
+        ct.env = ct.ExecutionEnv(host="local", host_ip="10.0.0.1")
+
+    def test_extracts_ip_and_domain(self):
+        result = MagicMock(returncode=0, stdout=SAMPLE_NETWORK_XML, stderr="")
+        with patch.object(ct.env, "run", return_value=result):
+            node_ip, cluster_domain = ct._parse_network_info("test-infra-net-caas")
+        self.assertEqual(node_ip, "192.168.160.10")
+        self.assertEqual(cluster_domain, "apps.test-infra-cluster-caas.redhat.com")
+
+    def test_exits_on_missing_network(self):
+        result = MagicMock(returncode=1, stdout="", stderr="Network not found")
+        with patch.object(ct.env, "run", return_value=result):
+            with self.assertRaises(SystemExit):
+                ct._parse_network_info("nonexistent")
+
+    def test_exits_on_missing_domain(self):
+        xml = "<network><ip family='ipv4' address='192.168.160.1' prefix='24'><dhcp><host ip='192.168.160.10'/></dhcp></ip></network>"
+        result = MagicMock(returncode=0, stdout=xml, stderr="")
+        with patch.object(ct.env, "run", return_value=result):
+            with self.assertRaises(SystemExit):
+                ct._parse_network_info("test-net")
+
+    def test_exits_on_missing_dhcp_host(self):
+        xml = "<network><domain name='example.com'/></network>"
+        result = MagicMock(returncode=0, stdout=xml, stderr="")
+        with patch.object(ct.env, "run", return_value=result):
+            with self.assertRaises(SystemExit):
+                ct._parse_network_info("test-net")
+
+
+class TestDetectDnsmasq(unittest.TestCase):
+    def setUp(self):
+        ct.env = ct.ExecutionEnv(host="local", host_ip="10.0.0.1")
+
+    def test_standalone_when_active(self):
+        result = MagicMock(returncode=0, stdout="active", stderr="")
+        with patch.object(ct.env, "run", return_value=result):
+            kind, path = ct._detect_dnsmasq()
+        self.assertEqual(kind, "standalone")
+        self.assertEqual(path, "/etc/dnsmasq.d")
+
+    def test_nm_when_inactive(self):
+        result = MagicMock(returncode=3, stdout="inactive", stderr="")
+        with patch.object(ct.env, "run", return_value=result):
+            kind, path = ct._detect_dnsmasq()
+        self.assertEqual(kind, "nm")
+        self.assertEqual(path, "/etc/NetworkManager/dnsmasq.d")
+
+
+class TestAgentVmDns(unittest.TestCase):
+    def setUp(self):
+        ct.env = ct.ExecutionEnv(host="local", host_ip="10.0.0.1")
+
+    def test_add_dns_creates_conf_standalone(self):
+        calls = []
+        written = {}
+        def mock_run(cmd, *, check=True):
+            calls.append(cmd)
+            if "cat " in cmd:
+                return MagicMock(returncode=1, stdout="", stderr="No such file")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        def mock_write(path, content):
+            written[path] = content
+        with patch.object(ct, "_detect_dnsmasq", return_value=("standalone", "/etc/dnsmasq.d")), \
+             patch.object(ct.env, "run", side_effect=mock_run), \
+             patch.object(ct.env, "write_file", side_effect=mock_write):
+            ct._agent_vm_add_dns("apps.example.com", "10.0.0.1")
+        self.assertIn("/etc/dnsmasq.d/apps-example-com.conf", written)
+        self.assertEqual(written["/etc/dnsmasq.d/apps-example-com.conf"], "address=/.apps.example.com/10.0.0.1\n")
+
+    def test_add_dns_idempotent(self):
+        calls = []
+        def mock_run(cmd, *, check=True):
+            calls.append(cmd)
+            if "cat " in cmd:
+                return MagicMock(returncode=0, stdout="address=/.apps.example.com/10.0.0.1", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(ct, "_detect_dnsmasq", return_value=("standalone", "/etc/dnsmasq.d")), \
+             patch.object(ct.env, "run", side_effect=mock_run), \
+             patch.object(ct.env, "write_file") as mock_write:
+            ct._agent_vm_add_dns("apps.example.com", "10.0.0.1")
+        mock_write.assert_not_called()
+
+    def test_remove_dns(self):
+        calls = []
+        def mock_run(cmd, *, check=True):
+            calls.append(cmd)
+            if "test -f" in cmd:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(ct, "_detect_dnsmasq", return_value=("nm", "/etc/NetworkManager/dnsmasq.d")), \
+             patch.object(ct.env, "run", side_effect=mock_run):
+            ct._agent_vm_remove_dns("apps.example.com")
+        self.assertTrue(any("rm -f" in c for c in calls))
+        self.assertTrue(any("nmcli general reload" in c for c in calls))
+
+    def test_remove_dns_noop_when_missing(self):
+        calls = []
+        def mock_run(cmd, *, check=True):
+            calls.append(cmd)
+            if "test -f" in cmd:
+                return MagicMock(returncode=1, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(ct, "_detect_dnsmasq", return_value=("standalone", "/etc/dnsmasq.d")), \
+             patch.object(ct.env, "run", side_effect=mock_run):
+            ct._agent_vm_remove_dns("apps.example.com")
+        self.assertFalse(any("rm -f" in c for c in calls))
+
+
+class TestAgentVmIsoDownload(unittest.TestCase):
+    def setUp(self):
+        ct.env = ct.ExecutionEnv(host="local", host_ip="10.0.0.1")
+
+    def test_downloads_iso(self):
+        calls = []
+        def mock_run(cmd, *, check=True):
+            calls.append(cmd)
+            if "-w" in cmd:
+                return MagicMock(returncode=0, stdout="200", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(ct.env, "run", side_effect=mock_run):
+            ct._agent_vm_download_iso("http://example.com/iso", "/data/storage")
+        self.assertTrue(any("--fail-with-body" in c for c in calls))
+
+
+class TestAgentVmCreateDestroy(unittest.TestCase):
+    def setUp(self):
+        ct.env = ct.ExecutionEnv(host="local", host_ip="10.0.0.1")
+
+    def test_create_vm_runs_virt_install(self):
+        calls = []
+        def mock_run(cmd, *, check=True):
+            calls.append(cmd)
+            if "virsh domstate" in cmd:
+                return MagicMock(returncode=1, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(ct.env, "run", side_effect=mock_run):
+            ct._agent_vm_create_vm("agent-worker-01", "test-net", "/data/storage", 16384, 4, "120G")
+        virt_install_cmds = [c for c in calls if "virt-install" in c]
+        self.assertEqual(len(virt_install_cmds), 1)
+        cmd = virt_install_cmds[0]
+        self.assertIn("--events on_poweroff=restart", cmd)
+        self.assertIn("--boot hd,cdrom", cmd)
+        self.assertIn("device=cdrom,readonly=on", cmd)
+        self.assertNotIn("--cdrom", cmd)
+
+    def test_create_vm_destroys_existing(self):
+        calls = []
+        def mock_run(cmd, *, check=True):
+            calls.append(cmd)
+            if "virsh domstate" in cmd:
+                return MagicMock(returncode=0, stdout="running", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(ct.env, "run", side_effect=mock_run):
+            ct._agent_vm_create_vm("agent-worker-01", "test-net", "/data/storage", 16384, 4, "120G")
+        self.assertTrue(any("virsh destroy" in c for c in calls))
+
+    def test_destroy_vm(self):
+        calls = []
+        def mock_run(cmd, *, check=True):
+            calls.append(cmd)
+            if "virsh domstate" in cmd:
+                return MagicMock(returncode=0, stdout="running", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(ct.env, "run", side_effect=mock_run):
+            ct._agent_vm_destroy_vm("agent-worker-01", "/data/storage")
+        self.assertTrue(any("virsh destroy" in c for c in calls))
+        self.assertTrue(any("virsh undefine" in c for c in calls))
+        self.assertTrue(any("rm -f" in c for c in calls))
+
+    def test_destroy_vm_not_found(self):
+        calls = []
+        def mock_run(cmd, *, check=True):
+            calls.append(cmd)
+            if "virsh domstate" in cmd:
+                return MagicMock(returncode=1, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(ct.env, "run", side_effect=mock_run):
+            ct._agent_vm_destroy_vm("agent-worker-01", "/data/storage")
+        self.assertFalse(any("virsh destroy" in c for c in calls))
+
+
+class TestAgentVmRemaining(unittest.TestCase):
+    def setUp(self):
+        ct.env = ct.ExecutionEnv(host="local", host_ip="10.0.0.1")
+
+    def test_finds_remaining_vms(self):
+        result = MagicMock(returncode=0, stdout="/data/agent-worker-01.qcow2\n/data/agent-worker-02.qcow2\n", stderr="")
+        with patch.object(ct.env, "run", return_value=result):
+            remaining = ct._agent_vm_remaining("/data", "agent-worker-01")
+        self.assertEqual(len(remaining), 1)
+        self.assertIn("agent-worker-02.qcow2", remaining[0])
+
+    def test_empty_when_last_vm(self):
+        result = MagicMock(returncode=0, stdout="/data/agent-worker-01.qcow2\n", stderr="")
+        with patch.object(ct.env, "run", return_value=result):
+            remaining = ct._agent_vm_remaining("/data", "agent-worker-01")
+        self.assertEqual(remaining, [])
+
+    def test_handles_missing_dir(self):
+        result = MagicMock(returncode=2, stdout="", stderr="No such file")
+        with patch.object(ct.env, "run", return_value=result):
+            remaining = ct._agent_vm_remaining("/nonexistent/path", "agent-worker-01")
+        self.assertEqual(remaining, [])
+
+
+class TestCmdAgentVm(unittest.TestCase):
+    def setUp(self):
+        ct.env = ct.ExecutionEnv(host="local", host_ip="10.0.0.1")
+
+    def _make_args(self, **kwargs):
+        defaults = {
+            "network": "test-infra-net-caas",
+            "iso_url": "http://example.com/iso",
+            "name": "agent-worker-01",
+            "memory": 16384,
+            "vcpus": 4,
+            "disk_size": "120G",
+            "storage_dir": "/tmp/test-storage",
+            "cluster_domain": None,
+            "node_ip": None,
+            "destroy": False,
+        }
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def test_create_requires_network(self):
+        with self.assertRaises(SystemExit):
+            ct.cmd_agent_vm(self._make_args(network=None))
+
+    def test_create_requires_iso_url(self):
+        with self.assertRaises(SystemExit):
+            ct.cmd_agent_vm(self._make_args(iso_url=None))
+
+    def test_create_calls_all_steps(self):
+        args = self._make_args(storage_dir="/tmp/test-storage")
+        with patch.object(ct, "_parse_network_info", return_value=("10.0.0.1", "apps.example.com")), \
+             patch.object(ct.env, "run", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch.object(ct, "_agent_vm_add_dns") as mock_dns, \
+             patch.object(ct, "_agent_vm_download_iso") as mock_iso, \
+             patch.object(ct, "_agent_vm_create_vm") as mock_create:
+            ct.cmd_agent_vm(args)
+        mock_dns.assert_called_once_with("apps.example.com", "10.0.0.1")
+        mock_iso.assert_called_once_with("http://example.com/iso", "/tmp/test-storage")
+        mock_create.assert_called_once_with("agent-worker-01", "test-infra-net-caas", "/tmp/test-storage", 16384, 4, "120G")
+
+    def test_create_uses_explicit_overrides(self):
+        args = self._make_args(
+            storage_dir="/tmp/test-storage",
+            node_ip="10.0.0.99",
+            cluster_domain="custom.apps.example.com",
+        )
+        with patch.object(ct, "_parse_network_info", return_value=("10.0.0.1", "apps.example.com")), \
+             patch.object(ct.env, "run", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch.object(ct, "_agent_vm_add_dns") as mock_dns, \
+             patch.object(ct, "_agent_vm_download_iso"), \
+             patch.object(ct, "_agent_vm_create_vm"):
+            ct.cmd_agent_vm(args)
+        mock_dns.assert_called_once_with("custom.apps.example.com", "10.0.0.99")
+
+    def test_destroy_cleans_shared_when_last(self):
+        args = self._make_args(destroy=True, storage_dir="/tmp/test-storage")
+        with patch.object(ct, "_agent_vm_destroy_vm") as mock_destroy, \
+             patch.object(ct, "_agent_vm_remaining", return_value=[]) as mock_remaining, \
+             patch.object(ct.env, "run", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch.object(ct, "_parse_network_info", return_value=("10.0.0.1", "apps.example.com")), \
+             patch.object(ct, "_agent_vm_remove_dns") as mock_dns:
+            ct.cmd_agent_vm(args)
+        mock_destroy.assert_called_once_with("agent-worker-01", "/tmp/test-storage")
+        mock_dns.assert_called_once()
+
+    def test_destroy_keeps_shared_when_others_remain(self):
+        args = self._make_args(destroy=True, storage_dir="/tmp/test-storage")
+        with patch.object(ct, "_agent_vm_destroy_vm"), \
+             patch.object(ct, "_agent_vm_remaining", return_value=["/tmp/test-storage/agent-worker-02.qcow2"]), \
+             patch.object(ct, "_agent_vm_remove_dns") as mock_dns:
+            ct.cmd_agent_vm(args)
+        mock_dns.assert_not_called()
+
+    def test_destroy_uses_explicit_cluster_domain_without_network(self):
+        args = self._make_args(
+            destroy=True, storage_dir="/tmp/test-storage",
+            network=None, cluster_domain="apps.example.com",
+        )
+        with patch.object(ct, "_agent_vm_destroy_vm"), \
+             patch.object(ct, "_agent_vm_remaining", return_value=[]), \
+             patch.object(ct.env, "run", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch.object(ct, "_agent_vm_remove_dns") as mock_dns:
+            ct.cmd_agent_vm(args)
+        mock_dns.assert_called_once_with("apps.example.com")
 
 
 if __name__ == "__main__":
